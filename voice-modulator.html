@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CRT Voice Modulator</title>
+<!--
+  CRT Voice Modulator: companion to the CRT End Credits stream monitor.
+  Takes a microphone (or any audio input), runs it through a tube-television signal chain in the
+  browser, and plays the result. One self-contained file: no network, no libraries, nothing is
+  recorded or sent anywhere. See README.md in this folder for how to get its sound into OBS.
+-->
+<style>
+:root{--a:#39f6ff;--b:#ff3bd4;--bg:#070a10;--panel:#0d131d;--ink:#cfe9ee;--dim:#6f8891}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace;padding:20px 16px 40px}
+main{max-width:980px;margin:0 auto}
+h1{font-size:20px;letter-spacing:.18em;margin:0 0 4px;color:var(--a);text-shadow:0 0 12px rgba(57,246,255,.5)}
+p{margin:6px 0;color:var(--dim)}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0}
+label{display:block}
+select,button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid #24414a;padding:8px 10px;border-radius:3px}
+select{max-width:100%}
+button{cursor:pointer}
+button:hover{border-color:var(--a)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--a);outline-offset:2px}
+#power{border-color:var(--a);color:var(--a);padding:10px 18px;letter-spacing:.12em}
+#power[aria-pressed=true]{background:var(--a);color:#001014}
+#presets button[aria-pressed=true]{border-color:var(--b);color:var(--b);box-shadow:0 0 10px rgba(255,59,212,.35)}
+#meter{flex:1 1 200px;height:12px;background:var(--panel);border:1px solid #24414a;position:relative;min-width:160px}
+#meter i{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,var(--a),var(--b))}
+#status{color:var(--b);min-height:1.45em}
+fieldset{border:1px solid #1c2f37;margin:14px 0;padding:10px 14px 14px}
+legend{color:var(--a);letter-spacing:.14em;padding:0 6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px 22px}
+.ctl span{display:flex;justify-content:space-between;gap:8px}
+.ctl output{color:var(--a)}
+input[type=range]{width:100%;accent-color:var(--a)}
+.check{display:flex;gap:8px;align-items:center}
+</style>
+</head>
+<body>
+<main>
+<h1>CRT VOICE MODULATOR</h1>
+<p>Makes a microphone sound like it is coming out of an old television. Pick the input, press POWER, choose a voice.</p>
+
+<div class="row">
+  <label>Input <select id="input"><option value="">Default microphone</option></select></label>
+  <label>Output <select id="output"><option value="">Default speakers</option></select></label>
+  <button id="power" aria-pressed="false">POWER</button>
+</div>
+<div class="row">
+  <div id="meter" role="img" aria-label="Output level"><i></i></div>
+  <label class="check"><input type="checkbox" id="bypass"> Bypass (hear the clean input)</label>
+  <label class="check"><input type="checkbox" id="denoise" checked> Browser noise suppression</label>
+</div>
+<p id="status" role="status"></p>
+
+<fieldset><legend>VOICES</legend><div class="row" id="presets"></div></fieldset>
+<div id="groups"></div>
+<p>Settings are remembered in this browser. Nothing leaves this page.</p>
+</main>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------------------------------------
+// Controls. Every value is a plain number, so a preset is just an object of overrides.
+const controls=[
+  // group, id, label, min, max, step, default, unit
+  ['TUBE SPEAKER','lowCut','1. Low cut (small speaker has no bass)',20,1200,10,320,'Hz'],
+  ['TUBE SPEAKER','highCut','2. High cut (no treble either)',1200,16000,100,3600,'Hz'],
+  ['TUBE SPEAKER','resonance','3. Speaker cone resonance',0,18,.5,7,'dB'],
+  ['TUBE SPEAKER','drive','4. Overdrive (speaker distortion)',0,100,1,28,''],
+  ['SIGNAL','crush','5. Digital crush (0 = off)',0,100,1,0,''],
+  ['SIGNAL','wobble','6. Tape wow and flutter',0,100,1,0,''],
+  ['SIGNAL','echo','7. Room echo',0,100,1,0,''],
+  ['SIGNAL','echoMs','   Echo time',30,500,5,110,'ms'],
+  ['SIGNAL','compress','8. Broadcast compression',0,100,1,45,''],
+  ['VOICE','pitch','9. Pitch shift',-12,12,1,0,'st'],
+  ['VOICE','ring','10. Robot (ring modulator)',0,100,1,0,''],
+  ['VOICE','ringHz','    Robot tone',20,800,5,70,'Hz'],
+  ['VOICE','tremolo','11. Tremolo (signal fading in and out)',0,100,1,0,''],
+  ['NOISE BED','hum','12. Mains hum',0,100,1,10,''],
+  ['NOISE BED','humHz','    Mains frequency',50,60,10,60,'Hz'],
+  ['NOISE BED','hiss','13. Tube hiss',0,100,1,12,''],
+  ['NOISE BED','crackle','14. Crackle',0,100,1,6,''],
+  ['OUTPUT','gate','15. Noise bed only while you speak',0,100,1,0,''],
+  ['OUTPUT','volume','Output volume',0,200,1,100,'%'],
+];
+const defaults=Object.fromEntries(controls.map(c=>[c[1],c[6]]));
+const presets={
+  'TV speaker':{},
+  'Clean':{lowCut:20,highCut:16000,resonance:0,drive:0,compress:0,hum:0,hiss:0,crackle:0},
+  'AM radio':{lowCut:420,highCut:2700,resonance:10,drive:45,compress:70,hiss:28,crackle:14,hum:4},
+  'Telephone':{lowCut:400,highCut:3000,resonance:4,drive:18,compress:60,hum:0,hiss:6,crackle:0},
+  'Intercom':{lowCut:520,highCut:2400,resonance:12,drive:60,crush:25,compress:80,echo:22,echoMs:70,hiss:10,hum:14,crackle:0},
+  'Megaphone':{lowCut:600,highCut:3200,resonance:14,drive:80,compress:85,echo:35,echoMs:180,hum:0,hiss:4,crackle:0},
+  'VHS tape':{lowCut:140,highCut:4800,resonance:3,drive:20,wobble:55,compress:50,hiss:40,hum:8,crackle:4},
+  'Robot':{lowCut:200,highCut:5200,resonance:5,drive:30,ring:85,ringHz:70,crush:30,compress:60,hum:0,hiss:4,crackle:0},
+  'Announcer':{lowCut:60,highCut:9000,resonance:0,drive:12,pitch:-2,compress:90,hum:0,hiss:5,crackle:0},
+  'Villain':{lowCut:60,highCut:5000,resonance:4,drive:40,pitch:-5,ring:25,ringHz:38,echo:28,echoMs:140,compress:70,hum:6,hiss:8,crackle:0},
+  'Chipmunk':{lowCut:300,highCut:9000,resonance:4,drive:15,pitch:7,compress:50,hum:0,hiss:6,crackle:0},
+  'Lost signal':{lowCut:480,highCut:2600,resonance:12,drive:55,crush:45,wobble:35,tremolo:70,compress:70,hiss:55,crackle:40,hum:16},
+};
+
+// ---------------------------------------------------------------------------------------------
+// Pitch shifter: a delay-line shifter with two crossfaded read heads, in an AudioWorklet. It is
+// loaded from a Blob, so the page stays one file. At 0 semitones it passes audio straight through.
+const pitchWorklet=`
+class CrtPitch extends AudioWorkletProcessor{
+  static get parameterDescriptors(){return [{name:'ratio',defaultValue:1,minValue:.25,maxValue:4,automationRate:'k-rate'}];}
+  constructor(){super();this.size=8192;this.buf=new Float32Array(this.size);this.w=0;this.d=0;this.win=1536;}
+  read(delay){const p=this.w-delay,i=Math.floor(p),f=p-i,m=this.size-1;return this.buf[i&m]*(1-f)+this.buf[(i+1)&m]*f;}
+  process(inputs,outputs,params){
+    const input=inputs[0][0],out=outputs[0][0],ratio=params.ratio[0],W=this.win;
+    if(!out)return true;
+    for(let n=0;n<out.length;n++){
+      const x=input?input[n]:0;this.buf[this.w&(this.size-1)]=x;
+      if(Math.abs(ratio-1)<1e-3){out[n]=x;}
+      else{
+        this.d+=1-ratio;if(this.d<0)this.d+=W;if(this.d>=W)this.d-=W;
+        const d2=(this.d+W/2)%W,g1=Math.sin(Math.PI*this.d/W),g2=Math.sin(Math.PI*d2/W);
+        out[n]=this.read(this.d+2)*g1*g1+this.read(d2+2)*g2*g2;
+      }
+      this.w++;
+    }
+    return true;
+  }
+}
+registerProcessor('crt-pitch',CrtPitch);`;
+
+const driveCurve=amount=>{const n=2048,c=new Float32Array(n),k=1+amount*.5;for(let i=0;i<n;i++){const x=i/(n-1)*2-1;c[i]=Math.tanh(k*x)/Math.tanh(k);}return c;};
+// Bit crush as a staircase transfer curve: fewer steps as the control rises (about 8 bits to 3).
+const crushCurve=amount=>{const n=4096,c=new Float32Array(n),steps=amount<=0?0:Math.round(2**(8-amount*.05));for(let i=0;i<n;i++){const x=i/(n-1)*2-1;c[i]=steps?Math.round(x*steps)/steps:x;}return c;};
+function noiseBuffer(ctx,seconds,fill){
+  const b=ctx.createBuffer(1,Math.round(ctx.sampleRate*seconds),ctx.sampleRate),d=b.getChannelData(0);fill(d);return b;
+}
+
+/** Builds the whole chain on any BaseAudioContext (live or offline). Returns the node to feed, the
+ * node to listen to, and `set(values)` to apply control values. */
+async function buildChain(ctx){
+  const g=v=>{const n=ctx.createGain();n.gain.value=v;return n;};
+  // A data: URL loads from a local file as well as from a web server (a Blob URL does not).
+  // If the browser refuses worklets altogether, everything except the pitch shift still works.
+  let pitch=null;
+  try{await ctx.audioWorklet.addModule('data:text/javascript;base64,'+btoa(pitchWorklet));
+    pitch=new AudioWorkletNode(ctx,'crt-pitch',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1],channelCount:1,channelCountMode:'explicit'});}
+  catch{pitch=null;}
+  const input=g(1),shifter=pitch||g(1);
+  const hp=ctx.createBiquadFilter();hp.type='highpass';hp.Q.value=.7;
+  const hp2=ctx.createBiquadFilter();hp2.type='highpass';hp2.Q.value=.7;
+  const lp=ctx.createBiquadFilter();lp.type='lowpass';lp.Q.value=.7;
+  const lp2=ctx.createBiquadFilter();lp2.type='lowpass';lp2.Q.value=.7;
+  const peak=ctx.createBiquadFilter();peak.type='peaking';peak.frequency.value=1700;peak.Q.value=1.6;
+  const drive=ctx.createWaveShaper();drive.oversample='2x';
+  const crush=ctx.createWaveShaper();
+  // Ring modulator: the wet path's gain is driven by an oscillator around zero.
+  const ringDry=g(1),ringWet=g(0),ringOsc=ctx.createOscillator(),ringDepth=g(0);ringOsc.connect(ringDepth).connect(ringWet.gain);ringOsc.start();
+  // Tremolo: slow, slightly irregular fading.
+  const trem=g(1),tremOsc=ctx.createOscillator(),tremOsc2=ctx.createOscillator(),tremDepth=g(0);tremOsc.frequency.value=3.1;tremOsc2.frequency.value=.43;
+  tremOsc.connect(tremDepth);tremOsc2.connect(tremDepth);tremDepth.connect(trem.gain);tremOsc.start();tremOsc2.start();
+  // Wow and flutter: a short delay whose length drifts, which bends the pitch.
+  const tape=ctx.createDelay(.1);tape.delayTime.value=.012;
+  const wow=ctx.createOscillator(),flutter=ctx.createOscillator(),wowDepth=g(0),flutterDepth=g(0);wow.frequency.value=.55;flutter.frequency.value=7.3;
+  wow.connect(wowDepth).connect(tape.delayTime);flutter.connect(flutterDepth).connect(tape.delayTime);wow.start();flutter.start();
+  // Echo.
+  const echo=ctx.createDelay(1),feedback=g(0),echoWet=g(0),echoTone=ctx.createBiquadFilter();echoTone.type='lowpass';echoTone.frequency.value=2400;
+  const comp=ctx.createDynamicsCompressor();comp.attack.value=.004;comp.release.value=.18;comp.knee.value=10;
+  const makeup=g(1),voice=g(1),bed=g(1),bedGate=g(1),mix=g(1),output=g(1);
+  // Safety limiter on the way out, so no voice can clip the stream.
+  const limiter=ctx.createDynamicsCompressor();limiter.threshold.value=-6;limiter.knee.value=3;limiter.ratio.value=20;limiter.attack.value=.002;limiter.release.value=.08;
+  const trim=g(.6);mix.connect(limiter).connect(trim).connect(output);
+
+  input.connect(shifter).connect(hp).connect(hp2).connect(lp).connect(lp2).connect(peak).connect(drive).connect(crush);
+  crush.connect(ringDry);crush.connect(ringWet);
+  ringDry.connect(trem);ringWet.connect(trem);
+  trem.connect(tape).connect(comp);
+  tape.connect(echo);echo.connect(echoTone).connect(feedback).connect(echo);echoTone.connect(echoWet).connect(comp);
+  comp.connect(makeup).connect(voice).connect(mix);
+
+  // Noise bed: hum (mains plus two harmonics), filtered hiss, and sparse crackle.
+  const humOscs=[1,2,3].map(()=>ctx.createOscillator()),humGain=g(0);
+  humOscs.forEach((o,i)=>{const lvl=g([1,.5,.22][i]);o.connect(lvl).connect(humGain);o.start();});
+  let seed=1984;const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;};
+  const hissSrc=ctx.createBufferSource();hissSrc.buffer=noiseBuffer(ctx,2,d=>{for(let i=0;i<d.length;i++)d[i]=rnd()*2-1;});hissSrc.loop=true;
+  const hissTone=ctx.createBiquadFilter();hissTone.type='bandpass';hissTone.frequency.value=3200;hissTone.Q.value=.5;const hissGain=g(0);
+  hissSrc.connect(hissTone).connect(hissGain);hissSrc.start();
+  const crackSrc=ctx.createBufferSource();crackSrc.buffer=noiseBuffer(ctx,4,d=>{for(let i=0;i<d.length;i++)if(rnd()<.0009){const a=(rnd()*2-1)*.9;for(let k=0;k<24&&i+k<d.length;k++)d[i+k]+=a*Math.exp(-k/5);}});crackSrc.loop=true;
+  const crackTone=ctx.createBiquadFilter();crackTone.type='highpass';crackTone.frequency.value=900;const crackGain=g(0);
+  crackSrc.connect(crackTone).connect(crackGain);crackSrc.start();
+  for(const n of [humGain,hissGain,crackGain])n.connect(bed);
+  bed.connect(bedGate).connect(mix);
+  // Gate follower: the bed can duck to silence while nobody is speaking.
+  const follower=ctx.createAnalyser();follower.fftSize=512;voice.connect(follower);
+
+  const t=()=>ctx.currentTime,ramp=(param,value)=>param.setTargetAtTime(value,t(),.02);
+  let last={};
+  function set(v){
+    const p={...defaults,...v};last=p;
+    if(pitch)ramp(pitch.parameters.get('ratio'),2**(p.pitch/12));
+    for(const f of [hp,hp2])ramp(f.frequency,p.lowCut);
+    for(const f of [lp,lp2])ramp(f.frequency,p.highCut);
+    ramp(peak.gain,p.resonance);
+    drive.curve=driveCurve(p.drive);crush.curve=crushCurve(p.crush);
+    const ring=p.ring/100;ramp(ringDry.gain,1-ring);ramp(ringDepth.gain,ring);ramp(ringOsc.frequency,p.ringHz);
+    ramp(trem.gain,1-p.tremolo/100*.45);ramp(tremDepth.gain,p.tremolo/100*.27);
+    ramp(wowDepth.gain,p.wobble/100*.0028);ramp(flutterDepth.gain,p.wobble/100*.00035);
+    ramp(echo.delayTime,p.echoMs/1000);ramp(feedback.gain,p.echo/100*.55);ramp(echoWet.gain,p.echo/100*.6);
+    const c=p.compress/100;ramp(comp.threshold,-6-c*30);ramp(comp.ratio,1+c*11);ramp(makeup.gain,1-c*.25);   // the compressor node adds its own make-up gain
+    humOscs.forEach((o,i)=>ramp(o.frequency,p.humHz*(i+1)));
+    ramp(humGain.gain,p.hum/100*.05);ramp(hissGain.gain,p.hiss/100*.12);ramp(crackGain.gain,p.crackle/100*.5);
+    ramp(output.gain,p.volume/100);
+  }
+  // Called on a timer by the page: opens the bed while the voice is above a small level.
+  function gateTick(){
+    const amount=(last.gate||0)/100;if(!amount){bedGate.gain.setTargetAtTime(1,t(),.05);return;}
+    const d=new Float32Array(follower.fftSize);follower.getFloatTimeDomainData(d);let peakLevel=0;for(const x of d)peakLevel=Math.max(peakLevel,Math.abs(x));
+    bedGate.gain.setTargetAtTime(peakLevel>.02?1:1-amount,t(),peakLevel>.02?.03:.35);
+  }
+  set({});
+  return {input,output,set,gateTick,canPitch:!!pitch};
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page.
+const $=id=>document.getElementById(id),STORE='crt-voice-modulator';
+let values={...defaults},active='TV speaker',ctx=null,chain=null,stream=null,source=null,clean=null,analyser=null,timer=0;
+const load=()=>{try{const s=JSON.parse(localStorage.getItem(STORE)||'null');if(s){values={...defaults,...s.values};active=s.active||'';}}catch{}};
+const save=()=>{try{localStorage.setItem(STORE,JSON.stringify({values,active}));}catch{}};
+const status=text=>{$('status').textContent=text;};
+
+function buildUi(){
+  for(const name of Object.keys(presets)){
+    const b=document.createElement('button');b.textContent=name;b.dataset.preset=name;
+    b.addEventListener('click',()=>{values={...defaults,...presets[name],volume:values.volume,humHz:values.humHz};active=name;refresh();});
+    $('presets').append(b);
+  }
+  const groups=new Map();
+  for(const [group,id,label,min,max,step,,unit] of controls){
+    if(!groups.has(group)){const f=document.createElement('fieldset'),l=document.createElement('legend'),grid=document.createElement('div');l.textContent=group;grid.className='grid';f.append(l,grid);$('groups').append(f);groups.set(group,grid);}
+    const wrap=document.createElement('label'),head=document.createElement('span'),name=document.createElement('b'),out=document.createElement('output'),range=document.createElement('input');
+    wrap.className='ctl';name.textContent=label.trim();name.style.fontWeight='normal';range.type='range';Object.assign(range,{min,max,step,id:'c-'+id});out.id='o-'+id;out.dataset.unit=unit;
+    range.addEventListener('input',()=>{values[id]=Number(range.value);active='';refresh();});
+    head.append(name,out);wrap.append(head,range);groups.get(group).append(wrap);
+  }
+}
+function refresh(){
+  for(const [,id,,,,,,unit] of controls){$('c-'+id).value=values[id];$('o-'+id).textContent=values[id]+(unit?' '+unit:'');}
+  for(const b of $('presets').children)b.setAttribute('aria-pressed',String(b.dataset.preset===active));
+  chain?.set(values);save();
+}
+async function listDevices(){
+  const devices=await navigator.mediaDevices.enumerateDevices();
+  for(const [kind,select,fallback] of [['audioinput',$('input'),'Default microphone'],['audiooutput',$('output'),'Default speakers']]){
+    const keep=select.value;select.replaceChildren(new Option(fallback,''));
+    for(const d of devices)if(d.kind===kind&&d.deviceId&&d.deviceId!=='default')select.append(new Option(d.label||kind+' '+select.length,d.deviceId));
+    select.value=[...select.options].some(o=>o.value===keep)?keep:'';
+  }
+}
+async function openInput(){
+  stream?.getTracks().forEach(t=>t.stop());source?.disconnect();
+  const audio={echoCancellation:false,autoGainControl:false,noiseSuppression:$('denoise').checked,channelCount:1};
+  if($('input').value)audio.deviceId={exact:$('input').value};
+  stream=await navigator.mediaDevices.getUserMedia({audio});
+  source=ctx.createMediaStreamSource(stream);route();await listDevices();
+}
+function route(){
+  if(!source)return;source.disconnect();
+  source.connect($('bypass').checked?clean:chain.input);
+}
+async function powerOn(){
+  if(!navigator.mediaDevices?.getUserMedia)throw new Error('This browser cannot open a microphone here. Open the page in Chrome or Edge.');
+  ctx=new AudioContext({latencyHint:'interactive'});
+  chain=await buildChain(ctx);chain.set(values);
+  clean=ctx.createGain();analyser=ctx.createAnalyser();analyser.fftSize=1024;
+  chain.output.connect(analyser);clean.connect(analyser);analyser.connect(ctx.destination);
+  await openInput();await setOutput();
+  const data=new Float32Array(analyser.fftSize),bar=$('meter').firstElementChild;
+  timer=setInterval(()=>{chain.gateTick();analyser.getFloatTimeDomainData(data);let p=0;for(const x of data)p=Math.max(p,Math.abs(x));bar.style.width=Math.min(100,p*100)+'%';},60);
+  status((chain.canPitch?'':'Pitch shift is unavailable in this browser. ')+`On air. Latency about ${Math.round(((ctx.baseLatency||0)+(ctx.outputLatency||0))*1000+(Math.abs(values.pitch)>0?16:0)+12)} ms.`);
+}
+async function powerOff(){
+  clearInterval(timer);stream?.getTracks().forEach(t=>t.stop());stream=source=chain=null;await ctx?.close();ctx=null;$('meter').firstElementChild.style.width='0';status('Off.');
+}
+async function setOutput(){
+  if(!ctx||typeof ctx.setSinkId!=='function')return;
+  try{await ctx.setSinkId($('output').value);}catch(error){status('Could not switch output: '+error.message);}
+}
+$('power').addEventListener('click',async()=>{
+  const on=$('power').getAttribute('aria-pressed')!=='true';
+  try{if(on)await powerOn();else await powerOff();$('power').setAttribute('aria-pressed',String(on));}
+  catch(error){await powerOff().catch(()=>{});$('power').setAttribute('aria-pressed','false');status(error.name==='NotAllowedError'?'Microphone access was refused. Allow it for this page and press POWER again.':'Could not start: '+error.message);}
+});
+$('input').addEventListener('change',()=>{if(ctx)openInput().catch(error=>status('Could not open that input: '+error.message));});
+$('denoise').addEventListener('change',()=>{if(ctx)openInput().catch(error=>status('Could not reopen the input: '+error.message));});
+$('output').addEventListener('change',setOutput);
+$('bypass').addEventListener('change',route);
+navigator.mediaDevices?.addEventListener?.('devicechange',()=>listDevices().catch(()=>{}));
+
+load();buildUi();refresh();listDevices().catch(()=>{});
+// For tests and tinkering.
+window.crtVoice={buildChain,presets,defaults,controls};
+</script>
+</body>
+</html>
